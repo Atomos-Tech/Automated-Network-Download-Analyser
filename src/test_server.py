@@ -1,12 +1,13 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-HTTPS Test File Server
+HTTPS/UDP Test File Server
 Provides local testing server for the network analyzer
 
 Features:
-- SSL/TLS encrypted connections (mandatory)
+- SSL/TLS encrypted connections (TCP)
+- UDP packet support
 - Concurrent client handling via threading
-- Configurable file sizes
+- Dynamic file size configuration via control endpoint
 - Connection statistics tracking
 - Auto-generated SSL certificates
 """
@@ -16,18 +17,26 @@ import ssl
 import threading
 import os
 import time
+import json
 from datetime import datetime
+from typing import Optional
 
 
 class HTTPSTestServer:
-    """HTTPS server for local testing with SSL/TLS support."""
+    """HTTPS/UDP server for local testing with SSL/TLS and UDP support."""
     
-    def __init__(self, host='0.0.0.0', port=8443, file_size_mb=10, max_connections=50):
+    def __init__(self, host='0.0.0.0', port=8443, file_size_mb=10, 
+                 max_connections=50, udp_port=9443, enable_udp=True):
         self.host = host
         self.port = port
-        self.file_size_mb = file_size_mb
+        self._file_size_mb = file_size_mb
         self.max_connections = max_connections
         self.running = False
+        self.enable_udp = enable_udp
+        self.udp_port = udp_port
+        
+        # Lock for thread-safe file size changes
+        self._file_size_lock = threading.Lock()
         
         # Statistics
         self.total_connections = 0
@@ -40,9 +49,29 @@ class HTTPSTestServer:
         print(f"Generating {file_size_mb}MB test file...")
         self.test_file_data = self._generate_test_file(file_size_mb)
         print(f"✓ Test file ready ({len(self.test_file_data):,} bytes)")
+        
+        # UDP statistics
+        self.udp_requests = 0
+        self.udp_errors = 0
+    
+    @property
+    def file_size_mb(self) -> int:
+        """Thread-safe getter for file size."""
+        with self._file_size_lock:
+            return self._file_size_mb
+    
+    @file_size_mb.setter
+    def file_size_mb(self, value: int):
+        """Thread-safe setter for file size."""
+        with self._file_size_lock:
+            self._file_size_mb = value
+            print(f"\n[INFO] File size changed to {value}MB")
+            # Regenerate test file data
+            self.test_file_data = self._generate_test_file(value)
+            print(f"[INFO] Test file regenerated ({len(self.test_file_data):,} bytes)")
     
     def _generate_test_file(self, size_mb: int) -> bytes:
-        """Generate test file data."""
+        """Generate test file data of specified size."""
         pattern = b"NETWORK_ANALYZER_TEST_DATA_" * 100
         size_bytes = size_mb * 1024 * 1024
         repetitions = (size_bytes // len(pattern)) + 1
@@ -124,55 +153,57 @@ class HTTPSTestServer:
             print("ERROR: cryptography library not installed")
             print("Install with: pip install cryptography")
             print("\nOr generate manually:")
-            print(f"  openssl req -x509 -newkey rsa:2048 -keyout {key_file} -out {cert_file} -days 365 -nodes -subj '/CN=localhost'")
+            print(f"  openssl req -x509 -newkey rsa:2048 -keyout {key_file} -out {cert_file} -days 365 -nodes -subj \'/CN=localhost\'")
             raise
     
     def _handle_client(self, client_socket, address):
-        """Handle individual client connection."""
-        start_time = time.time()
-        
+        """Handle individual TCP client connection."""
         with self.stats_lock:
             self.total_connections += 1
             conn_num = self.total_connections
         
         try:
-            # Receive HTTP request
-            request = client_socket.recv(4096).decode('utf-8', errors='ignore')
+            # Wrap with SSL
+            ssl_conn = ssl.wrap_socket(client_socket, server_side=True, 
+                                       do_handshake_on_connect=True)
             
-            if not request:
-                return
+            # Read HTTP request
+            request = ssl_conn.recv(4096).decode('utf-8', errors='ignore')
             
-            # Parse request line
+            # Parse request
             lines = request.split('\r\n')
-            if len(lines) < 1:
+            if not lines:
+                ssl_conn.close()
                 return
             
             request_line = lines[0]
+            parts = request_line.split(' ')
+            if len(parts) < 2:
+                ssl_conn.close()
+                return
             
-            # Build HTTP response
-            response_header = f"HTTP/1.1 200 OK\r\n"
-            response_header += f"Content-Type: application/octet-stream\r\n"
-            response_header += f"Content-Length: {len(self.test_file_data)}\r\n"
-            response_header += f"Server: NetworkAnalyzerTestServer/1.0\r\n"
-            response_header += f"Connection: close\r\n"
-            response_header += f"\r\n"
+            method = parts[0]
+            path = parts[1]
             
-            # Send response
-            client_socket.sendall(response_header.encode('utf-8'))
-            client_socket.sendall(self.test_file_data)
+            # Handle control endpoints for dynamic configuration
+            if path.startswith('/control/'):
+                self._handle_control_request(ssl_conn, path, method)
+            elif path == '/size':
+                # Return current file size
+                response = self._build_http_response(
+                    json.dumps({"size_mb": self.file_size_mb}).encode(),
+                    content_type="application/json"
+                )
+                ssl_conn.sendall(response)
+            else:
+                # Standard file download
+                self._send_file(ssl_conn, address, conn_num)
             
-            duration = time.time() - start_time
-            speed_mbps = (len(self.test_file_data) * 8) / (duration * 1024 * 1024)
-            
+        except ssl.SSLError as e:
             with self.stats_lock:
-                self.successful_transfers += 1
-                self.total_bytes_sent += len(self.test_file_data)
-            
+                self.failed_transfers += 1
             print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-                  f"#{conn_num} {address[0]} - "
-                  f"{len(self.test_file_data)/(1024*1024):.1f}MB "
-                  f"in {duration:.2f}s ({speed_mbps:.2f} Mbps)")
-            
+                  f"#{conn_num} {address[0]} - SSL Error: {e}")
         except Exception as e:
             with self.stats_lock:
                 self.failed_transfers += 1
@@ -184,8 +215,159 @@ class HTTPSTestServer:
             except:
                 pass
     
+    def _handle_control_request(self, ssl_conn, path: str, method: str):
+        """Handle control endpoint requests for dynamic configuration."""
+        if method != 'POST':
+            response = self._build_http_response(
+                b'{"error": "Method not allowed"}',
+                status=405,
+                content_type="application/json"
+            )
+            ssl_conn.sendall(response)
+            return
+        
+        # Parse control command
+        # e.g., /control/size/5 or /control/size/20
+        parts = path.strip('/').split('/')
+        if len(parts) >= 3 and parts[1] == 'size':
+            try:
+                new_size = int(parts[2])
+                if 1 <= new_size <= 100:  # Limit between 1-100 MB
+                    self.file_size_mb = new_size
+                    response = self._build_http_response(
+                        json.dumps({"success": True, "size_mb": new_size}).encode(),
+                        content_type="application/json"
+                    )
+                else:
+                    response = self._build_http_response(
+                        json.dumps({"error": "Size must be between 1 and 100 MB"}).encode(),
+                        status=400,
+                        content_type="application/json"
+                    )
+            except ValueError:
+                response = self._build_http_response(
+                    json.dumps({"error": "Invalid size value"}).encode(),
+                    status=400,
+                    content_type="application/json"
+                )
+        else:
+            response = self._build_http_response(
+                b'{"error": "Unknown control command"}',
+                status=404,
+                content_type="application/json"
+            )
+        
+        ssl_conn.sendall(response)
+    
+    def _build_http_response(self, body: bytes, status: int = 200, 
+                            content_type: str = "application/octet-stream") -> bytes:
+        """Build HTTP response headers and body."""
+        status_messages = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            500: "Internal Server Error"
+        }
+        
+        headers = [
+            f"HTTP/1.1 {status} {status_messages.get(status, 'Unknown')}",
+            f"Content-Type: {content_type}",
+            f"Content-Length: {len(body)}",
+            "Connection: close",
+            "",
+            ""
+        ]
+        
+        return "\r\n".join(headers).encode() + body
+    
+    def _send_file(self, ssl_conn, address, conn_num: int):
+        """Send test file to client over SSL connection."""
+        start_time = time.time()
+        
+        # Build HTTP response
+        headers = [
+            "HTTP/1.1 200 OK",
+            f"Content-Type: application/octet-stream",
+            f"Content-Length: {len(self.test_file_data)}",
+            f"Content-Disposition: attachment; filename=testfile_{self.file_size_mb}MB.bin",
+            "Connection: close",
+            "",
+            ""
+        ]
+        
+        response_headers = "\r\n".join(headers).encode()
+        ssl_conn.sendall(response_headers)
+        ssl_conn.sendall(self.test_file_data)
+        
+        duration = time.time() - start_time
+        speed_mbps = (len(self.test_file_data) * 8) / (duration * 1_000_000)
+        
+        with self.stats_lock:
+            self.successful_transfers += 1
+            self.total_bytes_sent += len(self.test_file_data)
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+              f"#{conn_num} {address[0]} - "
+              f"{len(self.test_file_data)/(1024*1024):.1f}MB "
+              f"in {duration:.2f}s ({speed_mbps:.2f} Mbps)")
+    
+    def _handle_udp_request(self, data: bytes, address: tuple, udp_socket: socket.socket):
+        """Handle UDP requests for file size info and control."""
+        self.udp_requests += 1
+        
+        try:
+            # Parse UDP command
+            # Format: "GET_SIZE" or "SET_SIZE:10" or "PING"
+            message = data.decode('utf-8', errors='ignore').strip()
+            
+            if message == "GET_SIZE":
+                response = f"SIZE:{self.file_size_mb}".encode()
+            elif message == "PING":
+                response = b"PONG"
+            elif message.startswith("SET_SIZE:"):
+                try:
+                    new_size = int(message.split(':')[1])
+                    if 1 <= new_size <= 100:
+                        self.file_size_mb = new_size
+                        response = f"OK:{new_size}".encode()
+                    else:
+                        response = b"ERROR:Size must be 1-100 MB"
+                except (ValueError, IndexError):
+                    response = b"ERROR:Invalid format"
+            else:
+                response = b"ERROR:Unknown command"
+            
+            udp_socket.sendto(response, address)
+            
+        except Exception as e:
+            self.udp_errors += 1
+            error_msg = f"ERROR:{str(e)}".encode()
+            udp_socket.sendto(error_msg, address)
+    
+    def _udp_listener(self):
+        """UDP listener thread for control commands."""
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_socket.bind((self.host, self.udp_port))
+        udp_socket.settimeout(1.0)
+        
+        print(f"✓ UDP control listener on port {self.udp_port}")
+        
+        while self.running:
+            try:
+                data, address = udp_socket.recvfrom(1024)
+                self._handle_udp_request(data, address, udp_socket)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"UDP error: {e}")
+        
+        udp_socket.close()
+    
     def start(self):
-        """Start the HTTPS server."""
+        """Start the HTTPS/UDP server."""
         # Create TCP socket
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -201,14 +383,25 @@ class HTTPSTestServer:
             
             self.running = True
             
+            # Start UDP listener thread
+            udp_thread = None
+            if self.enable_udp:
+                udp_thread = threading.Thread(target=self._udp_listener, daemon=True)
+                udp_thread.start()
+            
             print("=" * 80)
-            print("HTTPS TEST FILE SERVER")
+            print("HTTPS/UDP TEST FILE SERVER")
             print("=" * 80)
             print(f"Host: {self.host}")
-            print(f"Port: {self.port}")
-            print(f"File Size: {self.file_size_mb} MB")
+            print(f"TCP Port: {self.port} (HTTPS)")
+            if self.enable_udp:
+                print(f"UDP Port: {self.udp_port} (Control)")
+            print(f"File Size: {self.file_size_mb} MB (dynamic)")
             print(f"Max Connections: {self.max_connections}")
             print(f"URL: https://localhost:{self.port}/testfile")
+            print(f"Control: POST https://localhost:{self.port}/control/size/<MB>")
+            if self.enable_udp:
+                print(f"UDP Control: echo \"SET_SIZE:10\" | nc -u localhost {self.udp_port}")
             print("=" * 80)
             print("\nServer ready. Waiting for connections... (Ctrl+C to stop)\n")
             
@@ -247,10 +440,13 @@ class HTTPSTestServer:
         print(f"\n{'=' * 80}")
         print("SERVER STATISTICS")
         print(f"{'=' * 80}")
-        print(f"Total Connections: {self.total_connections}")
+        print(f"Total TCP Connections: {self.total_connections}")
         print(f"Successful: {self.successful_transfers}")
         print(f"Failed: {self.failed_transfers}")
         print(f"Total Data Sent: {self.total_bytes_sent / (1024**3):.2f} GB")
+        if self.enable_udp:
+            print(f"UDP Requests: {self.udp_requests}")
+            print(f"UDP Errors: {self.udp_errors}")
         if self.total_connections > 0:
             print(f"Success Rate: {(self.successful_transfers/self.total_connections*100):.1f}%")
         print(f"{'=' * 80}")
@@ -259,15 +455,19 @@ class HTTPSTestServer:
 def main():
     import argparse
     
-    parser = argparse.ArgumentParser(description='HTTPS Test File Server')
+    parser = argparse.ArgumentParser(description='HTTPS/UDP Test File Server')
     parser.add_argument('-H', '--host', default='0.0.0.0',
                        help='Host to bind (default: 0.0.0.0)')
     parser.add_argument('-p', '--port', type=int, default=8443,
-                       help='Port to listen (default: 8443)')
+                       help='TCP Port to listen (default: 8443)')
     parser.add_argument('-s', '--size', type=int, default=10,
                        help='File size in MB (default: 10)')
     parser.add_argument('-c', '--max-connections', type=int, default=50,
                        help='Max connections (default: 50)')
+    parser.add_argument('--udp-port', type=int, default=9443,
+                       help='UDP control port (default: 9443)')
+    parser.add_argument('--no-udp', action='store_true',
+                       help='Disable UDP control listener')
     
     args = parser.parse_args()
     
@@ -275,7 +475,9 @@ def main():
         host=args.host,
         port=args.port,
         file_size_mb=args.size,
-        max_connections=args.max_connections
+        max_connections=args.max_connections,
+        udp_port=args.udp_port,
+        enable_udp=not args.no_udp
     )
     
     try:

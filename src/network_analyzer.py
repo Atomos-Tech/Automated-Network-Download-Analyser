@@ -22,11 +22,21 @@ import time
 import json
 import os
 import hashlib
+import struct
 import threading
 import sys
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse
+
+
+UDP_DATA_MAGIC = 0x55445046  # "UDPF"
+UDP_REQUEST_FILE = b"GETF"
+UDP_PAYLOAD_SIZE = 1400
+UDP_RECEIVE_BUFFER = 2048
+UDP_MAX_RETRIES = 5
+UDP_IDLE_TIMEOUT_SECONDS = 1.0
+UDP_TRANSFER_TIMEOUT_SECONDS = 30.0
 
 
 class NetworkDownloadAnalyzer:
@@ -50,11 +60,12 @@ class NetworkDownloadAnalyzer:
                  timeout: int = 300,
                  results_dir: str = "results",
                  use_udp: bool = True,
+                 use_udp_transfer: bool = False,
                  udp_port: int = 9443,
                  file_size_mb: Optional[int] = None):
         """
         Initialize the analyzer.
-        
+
         Args:
             file_url: URL of file to download
             download_interval: Seconds between downloads (default: 3600 = 1 hour)
@@ -62,6 +73,7 @@ class NetworkDownloadAnalyzer:
             timeout: Socket timeout in seconds
             results_dir: Directory for results storage
             use_udp: Enable UDP control channel (default: True)
+            use_udp_transfer: Enable UDP file transfer instead of TCP/SSL (default: False)
             udp_port: UDP control port (default: 9443)
             file_size_mb: Request specific file size from server (optional)
         """
@@ -71,6 +83,7 @@ class NetworkDownloadAnalyzer:
         self.timeout = timeout
         self.results_dir = results_dir
         self.use_udp = use_udp
+        self.use_udp_transfer = use_udp_transfer
         self.udp_port = udp_port
         self.file_size_mb = file_size_mb
         
@@ -96,6 +109,7 @@ class NetworkDownloadAnalyzer:
         print(f"Target: {self.hostname}:{self.port}")
         print(f"SSL/TLS: {'Enabled' if self.use_ssl else 'Disabled'}")
         print(f"UDP Control: {'Enabled' if self.use_udp else 'Disabled'}")
+        print(f"UDP File Transfer: {'Enabled' if self.use_udp_transfer else 'Disabled'}")
         print(f"Session ID: {self.session_id}")
     
     def _parse_url(self, url: str) -> Tuple[str, int, bool, str]:
@@ -184,12 +198,12 @@ class NetworkDownloadAnalyzer:
     def _get_server_file_size(self) -> Optional[int]:
         """
         Query current file size from server via UDP.
-        
+
         Returns:
             File size in MB or None on error
         """
         response = self._send_udp_command("GET_SIZE")
-        
+
         if response and response.startswith("SIZE:"):
             try:
                 size = int(response.split(':')[1])
@@ -198,6 +212,211 @@ class NetworkDownloadAnalyzer:
             except (ValueError, IndexError):
                 pass
         return None
+
+    def _download_file_udp(self, download_num: int, elapsed_hours: float) -> Dict:
+        """
+        Perform file download over UDP with missing-packet retransmission.
+
+        UDP packet format (20-byte header + payload):
+        - 4 bytes: Magic "UDPF" (0x55445046)
+        - 4 bytes: Sequence number
+        - 4 bytes: Total packets
+        - 4 bytes: This chunk size
+        - 4 bytes: Total file size
+        - Payload: up to 1400 bytes
+
+        Args:
+            download_num: Download attempt number
+            elapsed_hours: Hours elapsed since start
+
+        Returns:
+            Dictionary containing download metrics
+        """
+        result = {
+            "timestamp": datetime.now().isoformat(),
+            "url": self.file_url,
+            "hostname": self.hostname,
+            "port": self.port,
+            "ssl_enabled": self.use_ssl,
+            "udp_transfer": True,
+            "success": False,
+            "status_code": None,
+            "file_size_bytes": 0,
+            "download_time_seconds": 0,
+            "connection_time_ms": 0,
+            "ssl_handshake_time_ms": 0,
+            "download_speed_bps": 0,
+            "download_speed_mbps": 0,
+            "md5_checksum": None,
+            "packets_expected": 0,
+            "packets_received": 0,
+            "packets_retransmitted": 0,
+            "udp_retries": 0,
+            "error": None,
+            "error_type": None
+        }
+
+        udp_socket = None
+
+        try:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting UDP download #{download_num}")
+            print(f"  Target: {self.hostname}:{self.udp_port} (UDP)")
+
+            # Create UDP socket
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_socket.settimeout(UDP_IDLE_TIMEOUT_SECONDS)
+
+            download_start = time.time()
+
+            # Send GET_FILE request (binary magic bytes)
+            udp_socket.sendto(UDP_REQUEST_FILE, (self.hostname, self.udp_port))
+            print(f"  [OK] UDP file request sent")
+
+            # Collect chunks
+            chunks = {}
+            total_chunks = None
+            total_file_size = None
+            packet_receive_count = 0
+            retries = 0
+
+            while time.time() - download_start < UDP_TRANSFER_TIMEOUT_SECONDS:
+                try:
+                    data, addr = udp_socket.recvfrom(UDP_RECEIVE_BUFFER)
+                    packet_receive_count += 1
+
+                    # Parse header (20 bytes)
+                    if len(data) < 20:
+                        print(f"  [UDP] Invalid packet: too small ({len(data)} bytes)")
+                        continue
+
+                    magic, seq, total, chunk_size, file_size = struct.unpack('!IIIII', data[:20])
+
+                    # Verify magic
+                    if magic != UDP_DATA_MAGIC:
+                        print(f"  [UDP] Invalid packet: bad magic (0x{magic:08X})")
+                        continue
+                    if seq >= total:
+                        print(f"  [UDP] Invalid packet: sequence {seq} outside total {total}")
+                        continue
+                    if len(data) - 20 < chunk_size:
+                        print(f"  [UDP] Invalid packet: truncated payload for sequence {seq}")
+                        continue
+
+                    # Store metadata
+                    if total_chunks is None:
+                        total_chunks = total
+                        total_file_size = file_size
+                        result["packets_expected"] = total_chunks
+                        print(f"  [OK] Transfer started: {total_file_size} bytes in {total_chunks} packets")
+                    elif total != total_chunks or file_size != total_file_size:
+                        print(f"  [UDP] Ignoring packet with inconsistent transfer metadata")
+                        continue
+
+                    # Extract payload
+                    payload = data[20:20 + chunk_size]
+                    chunks[seq] = payload
+
+                    if packet_receive_count % 100 == 0:
+                        print(f"  [UDP] Progress: {len(chunks)}/{total_chunks} packets")
+
+                    # Check if complete
+                    if len(chunks) == total_chunks:
+                        break
+
+                except socket.timeout:
+                    if total_chunks is None:
+                        retries += 1
+                        if retries > UDP_MAX_RETRIES:
+                            raise TimeoutError("No response from server")
+                        udp_socket.sendto(UDP_REQUEST_FILE, (self.hostname, self.udp_port))
+                        print(f"  [UDP] Retrying initial file request ({retries}/{UDP_MAX_RETRIES})")
+                        continue
+
+                    missing = [seq for seq in range(total_chunks) if seq not in chunks]
+                    if not missing:
+                        break
+                    if retries >= UDP_MAX_RETRIES:
+                        print(f"  [UDP] Retry limit reached with {len(missing)} missing packets")
+                        break
+
+                    retries += 1
+                    result["udp_retries"] = retries
+                    result["packets_retransmitted"] += len(missing)
+                    print(
+                        f"  [UDP] Requesting {len(missing)} missing packets "
+                        f"({retries}/{UDP_MAX_RETRIES})"
+                    )
+                    for batch_start in range(0, len(missing), 100):
+                        batch = missing[batch_start:batch_start + 100]
+                        command = "GET_MISSING:" + ",".join(str(seq) for seq in batch)
+                        udp_socket.sendto(command.encode(), (self.hostname, self.udp_port))
+
+            download_time = time.time() - download_start
+            result["connection_time_ms"] = download_time * 1000
+            result["download_time_seconds"] = download_time
+            result["packets_received"] = len(chunks)
+
+            # Reassemble file
+            if chunks:
+                file_data = b''.join(chunks.get(i, b'') for i in range(total_chunks or 0))
+                result["file_size_bytes"] = len(file_data)
+
+                # Calculate MD5
+                result["md5_checksum"] = hashlib.md5(file_data).hexdigest()
+
+                # Calculate speed
+                if download_time > 0:
+                    result["download_speed_bps"] = (len(file_data) * 8) / download_time
+                    result["download_speed_mbps"] = result["download_speed_bps"] / 1_000_000
+
+                # Verify completeness
+                if total_chunks is None or total_file_size is None:
+                    result["error"] = "Transfer metadata was not received"
+                    result["error_type"] = "missing_metadata"
+                    print(f"  ERROR: Transfer metadata was not received")
+                elif len(chunks) != total_chunks:
+                    missing_count = total_chunks - len(chunks)
+                    result["error"] = f"Incomplete transfer: {missing_count} packets missing"
+                    result["error_type"] = "incomplete"
+                    print(f"  ERROR: Incomplete transfer ({len(chunks)}/{total_chunks} packets)")
+                elif len(file_data) != total_file_size:
+                    result["error"] = (
+                        f"Incomplete transfer: expected {total_file_size}, got {len(file_data)}"
+                    )
+                    result["error_type"] = "incomplete"
+                    print(f"  ERROR: Incomplete transfer ({len(file_data)}/{total_file_size} bytes)")
+                else:
+                    result["success"] = True
+                    print(f"  SUCCESS")
+                    print(f"  File Size: {result['file_size_bytes'] / (1024*1024):.2f} MB")
+                    print(f"  Download Time: {result['download_time_seconds']:.2f} seconds")
+                    print(f"  Average Speed: {result['download_speed_mbps']:.2f} Mbps")
+                    print(f"  MD5 Checksum: {result['md5_checksum']}")
+                    print(f"  Packets: {len(chunks)}/{total_chunks}")
+                    print(f"  UDP Retries: {retries}")
+            else:
+                result["error"] = "No data received"
+                result["error_type"] = "no_data"
+                print(f"  ERROR: No data received")
+
+        except socket.timeout:
+            result["error"] = "UDP socket timeout"
+            result["error_type"] = "timeout"
+            print(f"  ERROR: UDP socket timeout")
+
+        except Exception as e:
+            result["error"] = str(e)
+            result["error_type"] = "general_error"
+            print(f"  ERROR: {e}")
+
+        finally:
+            if udp_socket:
+                try:
+                    udp_socket.close()
+                except:
+                    pass
+
+        return result
     
     def _create_tcp_socket(self) -> socket.socket:
         """
@@ -244,15 +463,19 @@ class NetworkDownloadAnalyzer:
     
     def _download_file(self, download_num: int, elapsed_hours: float) -> Dict:
         """
-        Perform single file download using TCP socket with SSL/TLS.
-        
+        Perform single file download using TCP socket with SSL/TLS or UDP.
+
         Args:
             download_num: Download attempt number
             elapsed_hours: Hours elapsed since start
-            
+
         Returns:
             Dictionary containing download metrics
         """
+        # Route to UDP if enabled for file transfer
+        if self.use_udp_transfer:
+            return self._download_file_udp(download_num, elapsed_hours)
+
         result = {
             "timestamp": datetime.now().isoformat(),
             "url": self.file_url,
@@ -271,24 +494,24 @@ class NetworkDownloadAnalyzer:
             "error": None,
             "error_type": None
         }
-        
+
         sock = None
-        
+
         try:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Starting download #{download_num}")
             print(f"  Target: {self.hostname}:{self.port}")
             print(f"  SSL/TLS: {self.use_ssl}")
-            
+
             # Create TCP socket
             sock = self._create_tcp_socket()
-            print(f"  ✓ TCP socket created")
-            
+            print(f"  [OK] TCP socket created")
+
             # Connect to server
             connect_start = time.time()
             sock.connect((self.hostname, self.port))
             connect_time = (time.time() - connect_start) * 1000
             result["connection_time_ms"] = connect_time
-            print(f"  ✓ TCP connection established ({connect_time:.2f}ms)")
+            print(f"  [OK] TCP connection established ({connect_time:.2f}ms)")
             
             # Wrap with SSL if required
             ssl_handshake_start = time.time()
@@ -297,11 +520,11 @@ class NetworkDownloadAnalyzer:
                 sock = ssl_sock
                 ssl_handshake_time = (time.time() - ssl_handshake_start) * 1000
                 result["ssl_handshake_time_ms"] = ssl_handshake_time
-                print(f"  ✓ SSL/TLS handshake complete ({ssl_handshake_time:.2f}ms)")
+                print(f"  [OK] SSL/TLS handshake complete ({ssl_handshake_time:.2f}ms)")
                 
                 # Print SSL protocol version
                 protocol = ssl_sock.version()
-                print(f"  ✓ Protocol: {protocol}")
+                print(f"  [OK] Protocol: {protocol}")
             
             # Build HTTP GET request
             request = f"GET {self.path} HTTP/1.1\r\n"
@@ -311,7 +534,7 @@ class NetworkDownloadAnalyzer:
             
             # Send request
             sock.sendall(request.encode())
-            print(f"  ✓ HTTP request sent")
+            print(f"  [OK] HTTP request sent")
             
             # Receive response
             download_start = time.time()
@@ -355,7 +578,7 @@ class NetworkDownloadAnalyzer:
             
             result["success"] = True
             
-            print(f"  ✓ SUCCESS")
+            print(f"  SUCCESS")
             print(f"  Status Code: {result['status_code']}")
             print(f"  File Size: {result['file_size_bytes'] / (1024*1024):.2f} MB")
             print(f"  Download Time: {download_time:.2f} seconds")
@@ -365,22 +588,22 @@ class NetworkDownloadAnalyzer:
         except socket.timeout:
             result["error"] = "Connection timeout"
             result["error_type"] = "timeout"
-            print(f"  ✗ ERROR: Connection timeout")
+            print(f"  ERROR: Connection timeout")
             
         except ssl.SSLError as e:
             result["error"] = str(e)
             result["error_type"] = "ssl_error"
-            print(f"  ✗ SSL/TLS Error: {e}")
+            print(f"  SSL/TLS Error: {e}")
             
         except ConnectionRefusedError:
             result["error"] = "Connection refused"
             result["error_type"] = "connection_refused"
-            print(f"  ✗ ERROR: Connection refused")
+            print(f"  ERROR: Connection refused")
             
         except Exception as e:
             result["error"] = str(e)
             result["error_type"] = "general_error"
-            print(f"  ✗ ERROR: {e}")
+            print(f"  ERROR: {e}")
             
         finally:
             if sock:
@@ -395,7 +618,10 @@ class NetworkDownloadAnalyzer:
         """Save results to JSON file."""
         filename = f"results_{self.session_id}.json"
         filepath = os.path.join(self.results_dir, filename)
-        
+
+        # Count UDP transfers
+        udp_transfers = sum(1 for r in self.download_results if r.get("udp_transfer", False))
+
         output = {
             "session_id": self.session_id,
             "timestamp": datetime.now().isoformat(),
@@ -404,7 +630,8 @@ class NetworkDownloadAnalyzer:
                 "hostname": self.hostname,
                 "port": self.port,
                 "ssl_enabled": self.use_ssl,
-                "udp_enabled": self.use_udp,
+                "udp_control_enabled": self.use_udp,
+                "udp_file_transfer": self.use_udp_transfer,
                 "download_interval": self.download_interval,
                 "total_duration": self.total_duration,
                 "timeout": self.timeout
@@ -413,14 +640,15 @@ class NetworkDownloadAnalyzer:
                 "total_downloads": self.total_downloads,
                 "successful_downloads": self.successful_downloads,
                 "failed_downloads": self.failed_downloads,
+                "udp_transfers": udp_transfers,
                 "success_rate": (self.successful_downloads / self.total_downloads * 100) if self.total_downloads > 0 else 0
             },
             "results": self.download_results
         }
-        
+
         with open(filepath, 'w') as f:
             json.dump(output, f, indent=2)
-        
+
         print(f"\nResults saved: {filepath}")
     
     def run_analysis(self):
@@ -439,12 +667,13 @@ class NetworkDownloadAnalyzer:
         print(f"Results Directory: {self.results_dir}")
         print("=" * 80 + "\n")
         
-        # Query or set initial file size via UDP
-        if self.use_udp and self.file_size_mb is not None:
-            self._set_server_file_size(self.file_size_mb)
-            time.sleep(1)  # Give server time to regenerate file
-        elif self.use_udp:
-            self._get_server_file_size()
+        # Query or set initial file size via UDP control channel
+        if self.use_udp:
+            if self.file_size_mb is not None:
+                self._set_server_file_size(self.file_size_mb)
+                time.sleep(1)  # Give server time to regenerate file
+            else:
+                self._get_server_file_size()
         
         try:
             while (time.time() - start_time) < self.total_duration:
@@ -573,16 +802,19 @@ def main():
 Examples:
   # Test mode (5 downloads, 1-minute intervals)
   python3 %(prog)s https://example.com/file.zip --test
-  
+
   # Full 24-hour analysis
   python3 %(prog)s https://example.com/file.zip
-  
+
   # Custom intervals (30 minutes between downloads)
   python3 %(prog)s https://example.com/file.zip --interval 1800 --duration 43200
-  
+
   # Set server file size via UDP (requires UDP support on server)
   python3 %(prog)s https://localhost:8443/testfile --size 20
-  
+
+  # Enable UDP file transfer (requires server with UDP support)
+  python3 %(prog)s https://localhost:8443/testfile --udp
+
   # Disable UDP control channel
   python3 %(prog)s https://example.com/file.zip --no-udp
         """
@@ -615,6 +847,9 @@ Examples:
     parser.add_argument('--no-udp',
                        action='store_true',
                        help='Disable UDP control channel')
+    parser.add_argument('--udp',
+                       action='store_true',
+                       help='Enable UDP file transfer (uses UDP instead of TCP/SSL for file downloads). Requires server with UDP support.')
     parser.add_argument('-s', '--size',
                        type=int,
                        help='Request file size from server in MB (via UDP)')
@@ -632,13 +867,16 @@ Examples:
     
     try:
         # Create and run analyzer
+        # UDP control channel: enabled by default, disabled with --no-udp
+        # UDP file transfer: disabled by default, enabled with --udp
         analyzer = NetworkDownloadAnalyzer(
             file_url=args.url,
             download_interval=args.interval,
             total_duration=args.duration,
             timeout=args.timeout,
             results_dir=args.results_dir,
-            use_udp=not args.no_udp,
+            use_udp=not args.no_udp,           # UDP control channel
+            use_udp_transfer=args.udp,         # UDP file transfer
             udp_port=args.udp_port,
             file_size_mb=args.size
         )

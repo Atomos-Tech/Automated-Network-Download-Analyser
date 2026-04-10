@@ -18,8 +18,15 @@ import threading
 import os
 import time
 import json
+import struct
 from datetime import datetime
 from typing import Optional
+
+
+UDP_DATA_MAGIC = 0x55445046  # "UDPF"
+UDP_REQUEST_FILE = b"GETF"
+UDP_PAYLOAD_SIZE = 1400
+UDP_RECEIVE_BUFFER = 4096
 
 
 class HTTPSTestServer:
@@ -48,11 +55,13 @@ class HTTPSTestServer:
         # Pre-generate test file data for performance
         print(f"Generating {file_size_mb}MB test file...")
         self.test_file_data = self._generate_test_file(file_size_mb)
-        print(f"✓ Test file ready ({len(self.test_file_data):,} bytes)")
+        print(f"[OK] Test file ready ({len(self.test_file_data):,} bytes)")
         
         # UDP statistics
         self.udp_requests = 0
         self.udp_errors = 0
+        self.udp_transfer_sessions = {}
+        self.udp_transfer_lock = threading.Lock()
     
     @property
     def file_size_mb(self) -> int:
@@ -77,6 +86,11 @@ class HTTPSTestServer:
         repetitions = (size_bytes // len(pattern)) + 1
         data = (pattern * repetitions)[:size_bytes]
         return data
+
+    def _get_file_snapshot(self) -> bytes:
+        """Return a consistent snapshot of the current test file data."""
+        with self._file_size_lock:
+            return self.test_file_data
     
     def _create_ssl_context(self) -> ssl.SSLContext:
         """Create SSL context with certificates."""
@@ -147,7 +161,7 @@ class HTTPSTestServer:
             with open(cert_file, "wb") as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
             
-            print(f"✓ Generated: {cert_file}, {key_file}")
+            print(f"[OK] Generated: {cert_file}, {key_file}")
             
         except ImportError:
             print("ERROR: cryptography library not installed")
@@ -156,16 +170,17 @@ class HTTPSTestServer:
             print(f"  openssl req -x509 -newkey rsa:2048 -keyout {key_file} -out {cert_file} -days 365 -nodes -subj \'/CN=localhost\'")
             raise
     
-    def _handle_client(self, client_socket, address):
+    def _handle_client(self, client_socket, address, ssl_context: ssl.SSLContext):
         """Handle individual TCP client connection."""
         with self.stats_lock:
             self.total_connections += 1
             conn_num = self.total_connections
+
+        ssl_conn = None
         
         try:
             # Wrap with SSL
-            ssl_conn = ssl.wrap_socket(client_socket, server_side=True, 
-                                       do_handshake_on_connect=True)
+            ssl_conn = ssl_context.wrap_socket(client_socket, server_side=True)
             
             # Read HTTP request
             request = ssl_conn.recv(4096).decode('utf-8', errors='ignore')
@@ -211,7 +226,10 @@ class HTTPSTestServer:
                   f"#{conn_num} {address[0]} - ERROR: {e}")
         finally:
             try:
-                client_socket.close()
+                if ssl_conn:
+                    ssl_conn.close()
+                else:
+                    client_socket.close()
             except:
                 pass
     
@@ -284,13 +302,15 @@ class HTTPSTestServer:
     def _send_file(self, ssl_conn, address, conn_num: int):
         """Send test file to client over SSL connection."""
         start_time = time.time()
+        file_data = self._get_file_snapshot()
+        file_size_mb = len(file_data) / (1024 * 1024)
         
         # Build HTTP response
         headers = [
             "HTTP/1.1 200 OK",
             f"Content-Type: application/octet-stream",
-            f"Content-Length: {len(self.test_file_data)}",
-            f"Content-Disposition: attachment; filename=testfile_{self.file_size_mb}MB.bin",
+            f"Content-Length: {len(file_data)}",
+            f"Content-Disposition: attachment; filename=testfile_{int(file_size_mb)}MB.bin",
             "Connection: close",
             "",
             ""
@@ -298,29 +318,139 @@ class HTTPSTestServer:
         
         response_headers = "\r\n".join(headers).encode()
         ssl_conn.sendall(response_headers)
-        ssl_conn.sendall(self.test_file_data)
+        ssl_conn.sendall(file_data)
         
         duration = time.time() - start_time
-        speed_mbps = (len(self.test_file_data) * 8) / (duration * 1_000_000)
+        speed_mbps = (len(file_data) * 8) / (duration * 1_000_000)
         
         with self.stats_lock:
             self.successful_transfers += 1
-            self.total_bytes_sent += len(self.test_file_data)
+            self.total_bytes_sent += len(file_data)
         
         print(f"[{datetime.now().strftime('%H:%M:%S')}] "
               f"#{conn_num} {address[0]} - "
-              f"{len(self.test_file_data)/(1024*1024):.1f}MB "
+              f"{len(file_data)/(1024*1024):.1f}MB "
               f"in {duration:.2f}s ({speed_mbps:.2f} Mbps)")
     
+    def _build_udp_packet(self, file_data: bytes, seq: int, total_chunks: int) -> bytes:
+        """Build one UDP file-transfer packet."""
+        total_size = len(file_data)
+        start = seq * UDP_PAYLOAD_SIZE
+        end = min(start + UDP_PAYLOAD_SIZE, total_size)
+        chunk = file_data[start:end]
+        header = struct.pack('!IIIII', UDP_DATA_MAGIC, seq, total_chunks, len(chunk), total_size)
+        return header + chunk
+
+    def _send_udp_chunks(self,
+                         address: tuple,
+                         udp_socket: socket.socket,
+                         file_data: bytes,
+                         sequences: list,
+                         total_chunks: int) -> int:
+        """Send selected UDP file chunks and return the number of packets sent."""
+        packets_sent = 0
+        for seq in sequences:
+            if 0 <= seq < total_chunks:
+                udp_socket.sendto(self._build_udp_packet(file_data, seq, total_chunks), address)
+                packets_sent += 1
+        return packets_sent
+
+    def _send_file_udp(self, address: tuple, udp_socket: socket.socket) -> None:
+        """
+        Send file over UDP in chunks.
+
+        Packet format (20-byte header + payload):
+        - 4 bytes: Magic "UDPF" (0x55445046)
+        - 4 bytes: Sequence number
+        - 4 bytes: Total packets
+        - 4 bytes: This chunk size
+        - 4 bytes: Total file size
+        - Payload: up to 1400 bytes
+        """
+        file_data = self._get_file_snapshot()
+        total_size = len(file_data)
+        total_chunks = (total_size + UDP_PAYLOAD_SIZE - 1) // UDP_PAYLOAD_SIZE
+
+        with self.udp_transfer_lock:
+            self.udp_transfer_sessions[address] = (file_data, total_chunks, time.time())
+
+        print(f"[UDP] Sending {total_size} bytes in {total_chunks} chunks to {address}")
+
+        packets_sent = self._send_udp_chunks(
+            address,
+            udp_socket,
+            file_data,
+            range(total_chunks),
+            total_chunks
+        )
+
+        with self.stats_lock:
+            self.successful_transfers += 1
+            self.total_bytes_sent += total_size
+
+        print(f"[UDP] File transfer queued to {address} ({packets_sent} packets)")
+
+    def _resend_udp_chunks(self,
+                           address: tuple,
+                           udp_socket: socket.socket,
+                           sequence_text: str) -> None:
+        """Resend selected UDP chunks requested by the client."""
+        with self.udp_transfer_lock:
+            session = self.udp_transfer_sessions.get(address)
+
+        if session:
+            file_data, total_chunks, _ = session
+        else:
+            file_data = self._get_file_snapshot()
+            total_chunks = (len(file_data) + UDP_PAYLOAD_SIZE - 1) // UDP_PAYLOAD_SIZE
+
+        sequences = []
+
+        for raw_seq in sequence_text.split(','):
+            raw_seq = raw_seq.strip()
+            if not raw_seq:
+                continue
+            try:
+                sequences.append(int(raw_seq))
+            except ValueError:
+                continue
+
+        packets_sent = self._send_udp_chunks(
+            address,
+            udp_socket,
+            file_data,
+            sequences,
+            total_chunks
+        )
+        print(f"[UDP] Resent {packets_sent}/{len(sequences)} requested chunks to {address}")
+
+    def _cleanup_udp_transfer_sessions(self) -> None:
+        """Discard old UDP transfer snapshots used for retransmission."""
+        cutoff = time.time() - 120
+        with self.udp_transfer_lock:
+            stale_addresses = [
+                address
+                for address, (_, _, created_at) in self.udp_transfer_sessions.items()
+                if created_at < cutoff
+            ]
+            for address in stale_addresses:
+                del self.udp_transfer_sessions[address]
+
     def _handle_udp_request(self, data: bytes, address: tuple, udp_socket: socket.socket):
         """Handle UDP requests for file size info and control."""
         self.udp_requests += 1
-        
+        self._cleanup_udp_transfer_sessions()
+
         try:
-            # Parse UDP command
-            # Format: "GET_SIZE" or "SET_SIZE:10" or "PING"
+            # Check for binary file transfer request.
+            if len(data) >= 4 and data[:4] == UDP_REQUEST_FILE:
+                # GET_FILE request - send file over UDP
+                self._send_file_udp(address, udp_socket)
+                return
+
+            # Parse text UDP command
             message = data.decode('utf-8', errors='ignore').strip()
-            
+
             if message == "GET_SIZE":
                 response = f"SIZE:{self.file_size_mb}".encode()
             elif message == "PING":
@@ -335,11 +465,14 @@ class HTTPSTestServer:
                         response = b"ERROR:Size must be 1-100 MB"
                 except (ValueError, IndexError):
                     response = b"ERROR:Invalid format"
+            elif message.startswith("GET_MISSING:"):
+                self._resend_udp_chunks(address, udp_socket, message.split(':', 1)[1])
+                return
             else:
                 response = b"ERROR:Unknown command"
-            
+
             udp_socket.sendto(response, address)
-            
+
         except Exception as e:
             self.udp_errors += 1
             error_msg = f"ERROR:{str(e)}".encode()
@@ -352,11 +485,11 @@ class HTTPSTestServer:
         udp_socket.bind((self.host, self.udp_port))
         udp_socket.settimeout(1.0)
         
-        print(f"✓ UDP control listener on port {self.udp_port}")
+        print(f"[OK] UDP control listener on port {self.udp_port}")
         
         while self.running:
             try:
-                data, address = udp_socket.recvfrom(1024)
+                data, address = udp_socket.recvfrom(UDP_RECEIVE_BUFFER)
                 self._handle_udp_request(data, address, udp_socket)
             except socket.timeout:
                 continue
@@ -377,9 +510,7 @@ class HTTPSTestServer:
             server_socket.bind((self.host, self.port))
             server_socket.listen(self.max_connections)
             
-            # Wrap with SSL
             ssl_context = self._create_ssl_context()
-            ssl_socket = ssl_context.wrap_socket(server_socket, server_side=True)
             
             self.running = True
             
@@ -407,12 +538,12 @@ class HTTPSTestServer:
             
             while self.running:
                 try:
-                    client_socket, address = ssl_socket.accept()
+                    client_socket, address = server_socket.accept()
                     
                     # Handle in thread
                     client_thread = threading.Thread(
                         target=self._handle_client,
-                        args=(client_socket, address),
+                        args=(client_socket, address, ssl_context),
                         daemon=True
                     )
                     client_thread.start()

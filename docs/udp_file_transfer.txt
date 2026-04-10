@@ -1,0 +1,137 @@
+UDP File Transfer Documentation
+===============================
+
+Overview
+--------
+
+The analyzer can now download the test file over UDP instead of HTTPS/TCP by
+passing the --udp flag to src/network_analyzer.py. The same UDP port also keeps
+the existing control commands for file-size management.
+
+Default ports:
+- TCP HTTPS download port: 8443
+- UDP control and file-transfer port: 9443
+
+UDP is connectionless and does not guarantee delivery or ordering, so this
+implementation adds application-level sequencing and retransmission.
+
+
+How to Run
+----------
+
+Start the local test server with UDP enabled:
+
+    python src/test_server.py --size 10
+
+Run a UDP file-transfer analysis:
+
+    python src/network_analyzer.py https://localhost:8443/testfile --udp --duration 60 --interval 30
+
+Request a different file size before the UDP transfer starts:
+
+    python src/network_analyzer.py https://localhost:8443/testfile --udp --size 20 --duration 60 --interval 30
+
+Use a non-default UDP port:
+
+    python src/test_server.py --udp-port 9555
+    python src/network_analyzer.py https://localhost:8443/testfile --udp --udp-port 9555
+
+
+Protocol
+--------
+
+The client starts a file transfer by sending this 4-byte UDP datagram:
+
+    GETF
+
+The server responds with a stream of UDP data packets. Each packet has a
+20-byte binary header followed by up to 1400 bytes of file data.
+
+Header fields are encoded in network byte order:
+
+    Field               Size    Description
+    Magic               4       0x55445046, the ASCII value "UDPF"
+    Sequence number     4       Zero-based packet index
+    Total packets       4       Number of packets in the full transfer
+    Payload size        4       Number of data bytes in this packet
+    Total file size     4       Full file size in bytes
+
+The client stores packets by sequence number and reassembles the file only when
+all expected packet indexes are present.
+
+
+Retransmission
+--------------
+
+If the client stops receiving packets before the transfer is complete, it
+calculates the missing sequence numbers and sends one or more text commands:
+
+    GET_MISSING:5,7,8,20
+
+The server resends only the requested packet indexes. The client retries missing
+packet requests up to five times. If packets are still missing after the retry
+limit, the result is marked as failed with error_type set to "incomplete".
+
+
+UDP Control Commands
+--------------------
+
+The UDP listener still supports the control commands used by the analyzer:
+
+    PING
+    GET_SIZE
+    SET_SIZE:<MB>
+
+Valid file sizes are 1 through 100 MB.
+
+
+Result Fields
+-------------
+
+UDP transfer results are written to the same JSON result files as TCP runs.
+UDP-specific fields include:
+
+    udp_transfer
+    packets_expected
+    packets_received
+    packets_retransmitted
+    udp_retries
+
+Common fields such as file_size_bytes, download_time_seconds,
+download_speed_bps, download_speed_mbps, md5_checksum, success, and error_type
+are also populated.
+
+
+Limitations
+-----------
+
+This UDP transfer mode is intended for measurement and coursework testing, not
+secure production downloads.
+
+Important limitations:
+- UDP file bytes are not encrypted.
+- No authentication is applied to UDP control or transfer commands.
+- The protocol retransmits missing packets but does not implement congestion
+  control like TCP.
+- Large transfers over lossy or rate-limited networks may still fail after the
+  retry limit.
+- Firewalls must allow inbound and outbound UDP traffic on the selected UDP
+  port.
+
+
+Troubleshooting
+---------------
+
+If the analyzer reports "No response from server":
+- Confirm the server was started without --no-udp.
+- Confirm --udp-port matches on both commands.
+- Check that local firewall rules allow UDP on the selected port.
+
+If the analyzer reports "Incomplete transfer":
+- Try a smaller --size value first.
+- Increase network reliability or run on localhost for baseline testing.
+- Re-run the analysis; the retry path may recover from transient packet loss.
+
+If TCP works but UDP does not:
+- TCP uses port 8443 by default, while UDP uses port 9443 by default.
+- Opening the TCP port alone is not enough for UDP file transfer.
